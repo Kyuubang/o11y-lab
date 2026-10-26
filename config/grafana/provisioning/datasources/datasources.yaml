@@ -1,0 +1,53 @@
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    uid: victoriametrics
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: victoriatraces
+
+  - name: VictoriaLogs
+    uid: victorialogs
+    type: victoriametrics-logs-datasource
+    access: proxy
+    url: http://victorialogs:9428
+    jsonData:
+      derivedFields:
+        - name: trace_id
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          datasourceUid: victoriatraces
+
+  - name: VictoriaTraces
+    uid: victoriatraces
+    type: jaeger
+    access: proxy
+    url: http://victoriatraces:10428/select/jaeger
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: victorialogs
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: false
+        filterBySpanID: false
+        customQuery: true
+        query: 'trace_id:"$${__trace.traceId}"'
+      tracesToMetrics:
+        datasourceUid: victoriametrics
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        tags:
+          - { key: service.name, value: service_name }
+        queries:
+          - name: Request rate
+            query: 'sum(rate(http_server_request_duration_seconds_count{$$__tags}[1m])) by (http_route)'
+      nodeGraph:
+        enabled: true

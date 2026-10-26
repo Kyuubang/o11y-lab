@@ -1,0 +1,79 @@
+// Grafana Alloy pipeline for the o11y lab.
+//
+//   apps --OTLP--> otelcol.receiver.otlp --> batch --+--> metrics --> VictoriaMetrics (remote_write)
+//                                                    +--> traces  --> VictoriaTraces  (OTLP/HTTP)
+//                                                    +--> logs    --> VictoriaLogs    (OTLP/HTTP)
+//   prometheus.scrape (stack self-metrics) ---------------------------> VictoriaMetrics
+//
+// UI: http://localhost:12345
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ------------------------------------------------------------------ OTLP in
+otelcol.receiver.otlp "default" {
+  grpc { endpoint = "0.0.0.0:4317" }
+  http { endpoint = "0.0.0.0:4318" }
+
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.prometheus.victoriametrics.input]
+    traces  = [otelcol.exporter.otlphttp.victoriatraces.input]
+    logs    = [otelcol.exporter.otlphttp.victorialogs.input]
+  }
+}
+
+// ---------------------------------------------------------------- metrics
+otelcol.exporter.prometheus "victoriametrics" {
+  // Keep service.* etc. as labels on every series (handy for a lab).
+  resource_to_telemetry_conversion = true
+  forward_to = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+prometheus.remote_write "victoriametrics" {
+  endpoint {
+    url = "http://victoriametrics:8428/api/v1/write"
+  }
+}
+
+// ----------------------------------------------------------------- traces
+otelcol.exporter.otlphttp "victoriatraces" {
+  client {
+    // otlphttp appends /v1/traces
+    endpoint = "http://victoriatraces:10428/insert/opentelemetry"
+    tls { insecure = true }
+  }
+}
+
+// ------------------------------------------------------------------- logs
+// Apps log to stdout (collected by Vector). This path exists for any client
+// that prefers to push OTLP logs to Alloy directly.
+otelcol.exporter.otlphttp "victorialogs" {
+  client {
+    endpoint = "http://victorialogs:9428/insert/opentelemetry"
+    tls { insecure = true }
+  }
+}
+
+// ---------------------------------------------------- stack self-monitoring
+prometheus.scrape "stack" {
+  scrape_interval = "15s"
+  targets = [
+    {"__address__" = "localhost:12345",       "job" = "alloy"},
+    {"__address__" = "victoriametrics:8428",  "job" = "victoriametrics"},
+    {"__address__" = "victorialogs:9428",     "job" = "victorialogs"},
+    {"__address__" = "victoriatraces:10428",  "job" = "victoriatraces"},
+    {"__address__" = "vector:9598",           "job" = "vector"},
+    {"__address__" = "grafana:3000",          "job" = "grafana"},
+  ]
+  forward_to = [prometheus.remote_write.victoriametrics.receiver]
+}

@@ -1,0 +1,70 @@
+# Vector pipeline for the o11y lab.
+#
+#   docker stdout/stderr (all o11y-lab containers)
+#     -> parse JSON app logs (slog: time, level, msg, trace_id, span_id, ...)
+#     -> VictoriaLogs (Elasticsearch bulk-compatible endpoint)
+#
+#   Vector internal metrics -> :9598/metrics (scraped by Alloy)
+#   Vector API/GraphQL      -> :8686 (use `vector top` inside the container)
+
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+
+sources:
+  docker:
+    type: docker_logs
+    include_labels:
+      - com.docker.compose.project=o11y-lab
+
+  vector_metrics:
+    type: internal_metrics
+
+transforms:
+  normalize:
+    type: remap
+    inputs: [docker]
+    source: |
+      .service = .label."com.docker.compose.service"
+      if .service == null { .service = .container_name }
+      del(.label)
+
+      parsed, err = parse_json(.message)
+      if err == null && is_object(parsed) {
+        parsed = object!(parsed)
+        . = merge(., parsed)
+        .message = to_string(parsed.msg) ?? .message
+        del(.msg)
+        if exists(parsed.time) {
+          .timestamp = parse_timestamp(to_string(parsed.time) ?? "", "%+") ?? .timestamp
+          del(.time)
+        }
+      }
+
+      if exists(.level) {
+        .level = downcase(to_string(.level) ?? "info")
+      } else if exists(.lvl) {
+        .level = downcase(to_string(.lvl) ?? "info")
+      } else {
+        .level = "info"
+      }
+
+sinks:
+  victorialogs:
+    type: elasticsearch
+    inputs: [normalize]
+    endpoints: ["http://victorialogs:9428/insert/elasticsearch/"]
+    api_version: v8
+    mode: bulk
+    compression: gzip
+    healthcheck:
+      enabled: false
+    query:
+      _msg_field: message
+      _time_field: timestamp
+      _stream_fields: service,container_name
+
+  prometheus:
+    type: prometheus_exporter
+    inputs: [vector_metrics]
+    address: 0.0.0.0:9598

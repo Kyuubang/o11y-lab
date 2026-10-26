@@ -1,0 +1,156 @@
+name: o11y-lab
+
+x-app-env: &app-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4317
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_METRIC_EXPORT_INTERVAL: "10000"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=lab,service.namespace=o11y-lab
+  SERVICE_VERSION: "0.1.0"
+
+services:
+  # ---------------------------------------------------------------- storage
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.154.1
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=7d
+      - -selfScrapeInterval=0
+    ports: ["${VM_PORT:-8428}:8428"]
+    volumes: [vmdata:/storage]
+    restart: unless-stopped
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.53.0
+    command:
+      - -storageDataPath=/vlogs
+      - -retentionPeriod=7d
+    ports: ["${VL_PORT:-9428}:9428"]
+    volumes: [vldata:/vlogs]
+    restart: unless-stopped
+
+  victoriatraces:
+    image: victoriametrics/victoria-traces:v0.12.0
+    command:
+      - -storageDataPath=/vtraces
+      - -retentionPeriod=7d
+    ports: ["${VT_PORT:-10428}:10428"]
+    volumes: [vtdata:/vtraces]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- collectors
+  # Alloy: OTLP receiver for app metrics + traces, scrapes stack self-metrics.
+  alloy:
+    image: grafana/alloy:v1.21.0
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "${ALLOY_UI_PORT:-12345}:12345"
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloydata:/var/lib/alloy/data
+    depends_on: [victoriametrics, victoriatraces, victorialogs]
+    restart: unless-stopped
+
+  # Vector: tails container stdout (JSON logs) and ships them to VictoriaLogs.
+  vector:
+    image: timberio/vector:0.60.0-alpine
+    command: ["--config", "/etc/vector/vector.yaml"]
+    ports: ["${VECTOR_API_PORT:-8686}:8686"]
+    volumes:
+      - ./config/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [victorialogs]
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- UI
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_PLUGINS_PREINSTALL_SYNC: victoriametrics-logs-datasource
+      GF_LOG_MODE: console
+      GF_LOG_CONSOLE_FORMAT: json
+    ports: ["${GRAFANA_PORT:-3300}:3000"]
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on: [victoriametrics, victorialogs, victoriatraces]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------ workloads
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: inventory
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  inventory-api:
+    build:
+      context: ./apps
+      args: { SERVICE: inventory-api }
+    image: o11y-lab/inventory-api:dev
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: inventory-api
+      DATABASE_URL: postgres://lab:lab@postgres:5432/inventory?sslmode=disable
+      CHAOS_ERROR_RATE: ${INVENTORY_CHAOS_ERROR_RATE:-0}
+      CHAOS_MAX_LATENCY_MS: ${INVENTORY_CHAOS_MAX_LATENCY_MS:-0}
+    ports: ["${INVENTORY_PORT:-8081}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      alloy: { condition: service_started }
+    restart: unless-stopped
+
+  order-api:
+    build:
+      context: ./apps
+      args: { SERVICE: order-api }
+    image: o11y-lab/order-api:dev
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: order-api
+      INVENTORY_URL: http://inventory-api:8080
+      CHAOS_ERROR_RATE: ${ORDER_CHAOS_ERROR_RATE:-0}
+      CHAOS_MAX_LATENCY_MS: ${ORDER_CHAOS_MAX_LATENCY_MS:-0}
+    ports: ["${ORDER_PORT:-8082}:8080"]
+    depends_on: [inventory-api]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------ load test
+  # Started on demand: `docker compose run --rm k6 run /scripts/load.js`
+  k6:
+    image: grafana/k6:1.8.2
+    profiles: [loadtest]
+    environment:
+      INVENTORY_URL: http://inventory-api:8080
+      ORDER_URL: http://order-api:8080
+      K6_PROMETHEUS_RW_SERVER_URL: http://victoriametrics:8428/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: p(95),p(99),avg,max
+    volumes:
+      - ./loadtest:/scripts:ro
+    depends_on: [order-api, inventory-api]
+
+volumes:
+  vmdata: {}
+  vldata: {}
+  vtdata: {}
+  alloydata: {}
+  grafanadata: {}
+  pgdata: {}
